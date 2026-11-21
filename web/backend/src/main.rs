@@ -9528,12 +9528,24 @@ fn is_private_web_root_file(relative: &str) -> bool {
         "package.json",
         "package-lock.json",
     ];
-    let name = relative.rsplit('/').next().unwrap_or(relative);
-    let lowered = name.to_ascii_lowercase();
-    PRIVATE.contains(&lowered.as_str())
-        // Dotfiles in general: `.env` and friends are exactly the kind of
-        // thing that appears next to a Dockerfile later on.
-        || lowered.starts_with('.')
+    let mut components = relative.split(['/', '\\']).filter(|part| !part.is_empty());
+    // The backend's sources and build output sit inside the web root when the
+    // server runs from the source tree.
+    if components
+        .clone()
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case("backend"))
+    {
+        return true;
+    }
+    // Every component, not just the file name: a dot-directory such as the
+    // default `.reopenscad-workspaces` data dir holds share pointers that name
+    // the editable design, so nothing beneath one may be served.
+    components.any(|part| part.starts_with('.'))
+        || relative
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|name| PRIVATE.contains(&name.to_ascii_lowercase().as_str()))
 }
 
 fn handle_static(

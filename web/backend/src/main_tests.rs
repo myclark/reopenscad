@@ -2968,6 +2968,18 @@ fn deployment_files_are_not_served_from_the_web_root() {
         ".env",
         ".env.production",
         "package.json",
+        // Dot-directories anywhere in the path, not only dotfile names: the
+        // default data dir sits in the web root and its `.share` pointers
+        // name the editable design.
+        ".reopenscad-workspaces/0123456789abcdef0123456789abcdef.share",
+        ".reopenscad-workspaces/render-cache/x.json",
+        "examples/.hidden/file.scad",
+        "./index.html",
+        "examples/../.reopenscad-workspaces/a.json",
+        // The backend source tree, however the leading slash was spelled.
+        "backend/src/main.rs",
+        "Backend/Cargo.toml",
+        "/backend/Cargo.toml",
     ] {
         assert!(is_private_web_root_file(private), "{private} was servable");
     }
@@ -3119,6 +3131,66 @@ fn serve_over_socket_with_origin(public_origin: Option<&str>, raw: &str) -> Stri
 
 fn get(path: &str) -> String {
     serve_over_socket(&format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:5173\r\n\r\n"))
+}
+
+/// The default data dir lives inside the web root when the server runs from
+/// the source tree, and a `.share` pointer there holds the *editable* design
+/// id. Percent-encoding the leading dot must not reach it, nor the backend
+/// tree behind an encoded `b`.
+#[test]
+fn encoded_paths_do_not_reach_the_data_dir_or_backend() {
+    let web = std::env::temp_dir().join(format!(
+        "reopenscad-static-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let token = "0123456789abcdef0123456789abcdef";
+    let secret = "wobbly-wombat-00000000000000000000000000cc";
+    fs::create_dir_all(web.join(".reopenscad-workspaces")).unwrap();
+    fs::create_dir_all(web.join("backend")).unwrap();
+    fs::write(web.join(".reopenscad-workspaces").join(format!("{token}.share")), secret).unwrap();
+    fs::write(web.join("backend").join("Cargo.toml"), "backend-secret").unwrap();
+    fs::write(web.join("index.html"), "<title>shell</title>").unwrap();
+
+    let serve = |path: &str| {
+        let (mut state, root) = temporary_state(None);
+        state.web_root = web.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let raw = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:5173\r\n\r\n");
+        let client = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            let mut response = Vec::new();
+            let _ = stream.read_to_end(&mut response);
+            String::from_utf8_lossy(&response).into_owned()
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        serve_request(&mut stream, &state, &mut None).unwrap();
+        drop(stream);
+        let response = client.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+        response
+    };
+
+    for path in [
+        format!("/.reopenscad-workspaces/{token}.share"),
+        format!("/%2ereopenscad-workspaces/{token}.share"),
+        format!("/%2Ereopenscad-workspaces%2f{token}.share"),
+        format!("//.reopenscad-workspaces/{token}.share"),
+        format!("/backend/../.reopenscad-workspaces/{token}.share"),
+        "/backend/Cargo.toml".to_string(),
+        "/%62ackend/Cargo.toml".to_string(),
+        "//backend/Cargo.toml".to_string(),
+    ] {
+        let response = serve(&path);
+        assert!(response.starts_with("HTTP/1.1 404"), "{path} was served: {response}");
+        assert!(!response.contains(secret), "{path} leaked the design id");
+        assert!(!response.contains("backend-secret"), "{path} leaked the backend tree");
+    }
+    assert!(serve("/index.html").starts_with("HTTP/1.1 200"));
+    let _ = fs::remove_dir_all(&web);
 }
 
 /// Header block only. The shell's own text talks about these headers, so a
